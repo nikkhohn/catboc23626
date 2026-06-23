@@ -13,6 +13,7 @@ from typing import Optional
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
+from aiohttp import web
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -29,6 +30,7 @@ USER_SESSION       = os.environ["USER_SESSION"]
 OWNER_ID           = int(os.environ["OWNER_ID"])
 
 TERABOX_DOWNLOADER_BOT = "@TeraBoxDownloader_TgBot"
+PORT = int(os.environ.get("PORT", 8080))
 
 # TeraBox domains regex
 TERABOX_RE = re.compile(
@@ -299,6 +301,20 @@ def make_userbot() -> Client:
         session_string=USER_SESSION,
     )
 
+# ─── Health Check Server (Render Web Service ke liye) ────────────────────────
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"✅ Health server running on port {PORT}")
+
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 async def main():
     userbot = make_userbot()
@@ -310,6 +326,7 @@ async def main():
     log.info("✅ Both clients started!")
 
     asyncio.create_task(queue_worker(bot, userbot))
+    await start_health_server()
 
     await idle()
 
