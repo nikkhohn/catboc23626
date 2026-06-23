@@ -30,6 +30,8 @@ USER_SESSION       = os.environ["USER_SESSION"]
 OWNER_ID           = int(os.environ["OWNER_ID"])
 
 TERABOX_DOWNLOADER_BOT = "@TeraBoxDownloader_TgBot"
+CATBOX_USERHASH    = os.environ.get("CATBOX_USERHASH", "")       # optional, empty = anonymous (72hr)
+PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")    # required for pixeldrain
 PORT = int(os.environ.get("PORT", 8080))
 
 # TeraBox domains regex
@@ -67,7 +69,7 @@ processing_lock = asyncio.Lock()
 async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename: str) -> str:
     form = aiohttp.FormData()
     form.add_field("reqtype",      "fileupload")
-    form.add_field("userhash",     "")
+    form.add_field("userhash",     CATBOX_USERHASH)
     form.add_field("fileToUpload", data, filename=filename,
                    content_type="application/octet-stream")
 
@@ -85,12 +87,16 @@ async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename
 
 # ─── Pixeldrain Upload ────────────────────────────────────────────────────────
 async def upload_to_pixeldrain(session: aiohttp.ClientSession, data: bytes, filename: str) -> str:
+    if not PIXELDRAIN_API_KEY:
+        raise ValueError("PIXELDRAIN_API_KEY not set")
     form = aiohttp.FormData()
     form.add_field("file", data, filename=filename, content_type="application/octet-stream")
+    auth = aiohttp.BasicAuth(login="", password=PIXELDRAIN_API_KEY)
 
     async with session.post(
         "https://pixeldrain.com/api/file",
         data=form,
+        auth=auth,
         timeout=aiohttp.ClientTimeout(total=300),
     ) as resp:
         result = await resp.json()
