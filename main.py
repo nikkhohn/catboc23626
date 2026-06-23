@@ -52,6 +52,7 @@ class Job:
     image_filename:      str = "thumbnail.jpg"
     catbox_image_url:    Optional[str] = None
     catbox_video_url:    Optional[str] = None
+    pixeldrain_video_url: Optional[str] = None
     sent_msg_id:         Optional[int] = None   # msg id of link we sent to TeraBox bot
     created_at:          float = field(default_factory=time.time)
 
@@ -80,6 +81,23 @@ async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename
         if not url.startswith("https://"):
             raise ValueError(f"Catbox unexpected response: {url}")
         return url
+
+
+# ─── Pixeldrain Upload ────────────────────────────────────────────────────────
+async def upload_to_pixeldrain(session: aiohttp.ClientSession, data: bytes, filename: str) -> str:
+    form = aiohttp.FormData()
+    form.add_field("file", data, filename=filename, content_type="application/octet-stream")
+
+    async with session.put(
+        f"https://pixeldrain.com/api/file/{filename}",
+        data=form,
+        timeout=aiohttp.ClientTimeout(total=300),
+    ) as resp:
+        resp.raise_for_status()
+        result = await resp.json()
+        if "id" not in result:
+            raise ValueError(f"Pixeldrain unexpected response: {result}")
+        return f"https://pixeldrain.com/u/{result['id']}"
 
 # ─── Queue Worker ─────────────────────────────────────────────────────────────
 async def queue_worker(bot: Client, userbot: Client):
@@ -138,12 +156,15 @@ async def process_job(bot: Client, userbot: Client,
     if job.catbox_video_url.startswith("ERROR:"):
         raise RuntimeError(job.catbox_video_url)
 
+    log.info(f"Catbox video done: {job.catbox_video_url}")
+
     # Step 4: Done — DM owner
     await bot.send_message(
         job.chat_id,
         f"✅ **Done!**\n\n"
         f"🖼 **Image (Catbox):**\n{job.catbox_image_url}\n\n"
-        f"🎬 **Video (Catbox):**\n{job.catbox_video_url}",
+        f"🎬 **Video (Catbox):**\n{job.catbox_video_url}\n\n"
+        f"🎬 **Video (Pixeldrain):**\n{job.pixeldrain_video_url or 'Upload failed'}",
     )
     log.info(f"Job complete: {job.terabox_url}")
 
@@ -198,13 +219,21 @@ def attach_reply_monitor(userbot: Client):
                 video_filename = message.document.file_name
 
             async with aiohttp.ClientSession() as sess:
-                job.catbox_video_url = await upload_to_catbox(sess, video_bytes, video_filename)
+                # Upload to Catbox and Pixeldrain simultaneously
+                catbox_task = upload_to_catbox(sess, video_bytes, video_filename)
+                pixeldrain_task = upload_to_pixeldrain(sess, video_bytes, video_filename)
+                results = await asyncio.gather(catbox_task, pixeldrain_task, return_exceptions=True)
 
-            log.info(f"Video uploaded: {job.catbox_video_url}")
+            catbox_result, pd_result = results
+            job.catbox_video_url = str(catbox_result) if not isinstance(catbox_result, Exception) else f"ERROR: {catbox_result}"
+            job.pixeldrain_video_url = str(pd_result) if not isinstance(pd_result, Exception) else f"Upload failed: {pd_result}"
+
+            log.info(f"Catbox: {job.catbox_video_url} | Pixeldrain: {job.pixeldrain_video_url}")
 
         except Exception as e:
             log.exception(f"Video upload failed: {e}")
             job.catbox_video_url = f"ERROR: {e}"
+            job.pixeldrain_video_url = "Upload failed"
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
