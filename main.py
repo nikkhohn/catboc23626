@@ -35,12 +35,13 @@ USER_SESSION       = os.environ["USER_SESSION"]
 OWNER_ID           = int(os.environ["OWNER_ID"])
 
 TERABOX_DOWNLOADER_BOT = "@TeraBoxDownloader_TgBot"
-CATBOX_USERHASH      = os.environ.get("CATBOX_USERHASH", "")
+CATBOX_USERHASH = os.environ.get("CATBOX_USERHASH", "")  # optional, empty = anonymous (72hr)
 FIREBASE_URL         = os.environ.get("FIREBASE_URL", "")
 FIREBASE_CRED_JSON   = os.environ.get("FIREBASE_CRED_JSON", "")
 FIREBASE_CRED_PATH   = os.environ.get("FIREBASE_CRED_PATH", "serviceAccountKey.json")
 PORT = int(os.environ.get("PORT", 8080))
 
+# TeraBox domains regex
 TERABOX_RE = re.compile(
     r"https?://(?:www\.)?"
     r"(?:terabox\.com|teraboxapp\.com|teraboxlink\.com|freeterabox\.com|"
@@ -105,11 +106,14 @@ class Job:
     image_filename:      str = "thumbnail.jpg"
     catbox_image_url:    Optional[str] = None
     catbox_video_url:    Optional[str] = None
-    sent_msg_id:         Optional[int] = None
+    sent_msg_id:         Optional[int] = None   # msg id of link we sent to TeraBox bot
     created_at:          float = field(default_factory=time.time)
 
 job_queue:    asyncio.Queue  = asyncio.Queue()
+
+# sent_msg_id → Job  (for exact reply matching)
 pending_jobs: dict[int, Job] = {}
+
 processing_lock = asyncio.Lock()
 
 # ─── Catbox Upload ────────────────────────────────────────────────────────────
@@ -119,6 +123,7 @@ async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename
     form.add_field("userhash",     CATBOX_USERHASH)
     form.add_field("fileToUpload", data, filename=filename,
                    content_type="application/octet-stream")
+
     async with session.post(
         "https://catbox.moe/user/api.php",
         data=form,
@@ -129,6 +134,7 @@ async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename
         if not url.startswith("https://"):
             raise ValueError(f"Catbox unexpected response: {url}")
         return url
+
 
 # ─── Queue Worker ─────────────────────────────────────────────────────────────
 async def queue_worker(bot: Client, userbot: Client):
@@ -158,7 +164,7 @@ async def process_job(bot: Client, userbot: Client,
     )
     log.info(f"Image uploaded: {job.catbox_image_url}")
 
-    # Step 2: Send TeraBox link via userbot
+    # Step 2: Send TeraBox link via userbot (FloodWait handled)
     await bot.send_message(job.chat_id, "📤 TeraBox bot ko link bhej raha hun...")
     while True:
         try:
@@ -183,13 +189,18 @@ async def process_job(bot: Client, userbot: Client,
 
     if job.catbox_video_url is None:
         raise TimeoutError("TeraBox bot ne 8 minute mein video nahi diya.")
+
+    if job.catbox_video_url == "SKIP":
+        log.info(f"Job skipped (TeraBox failed): {job.terabox_url}")
+        return
+
     if job.catbox_video_url.startswith("ERROR:"):
         raise RuntimeError(job.catbox_video_url)
 
     log.info(f"Catbox video done: {job.catbox_video_url}")
 
     # ── Firebase mein save karo ───────────────────────────────────────────────
-    video_url = job.catbox_video_url  # Catbox video URL website pe use hoga
+    video_url = job.catbox_video_url
     image_url = job.catbox_image_url or ""
     caption   = random.choice(CAPTIONS)
 
@@ -219,11 +230,34 @@ async def process_job(bot: Client, userbot: Client,
 
 # ─── Userbot: TeraBox bot reply monitor ──────────────────────────────────────
 def attach_reply_monitor(userbot: Client):
+    """
+    TeraBox bot replies to our sent message with the video.
+    We match via reply_to_message.id == job.sent_msg_id — 100% accurate.
+    """
+
+    @userbot.on_message(
+        filters.user(TERABOX_DOWNLOADER_BOT)
+        & filters.text
+    )
+    async def terabox_failure_received(client: Client, message: Message):
+        """TeraBox bot sends text when link fails — skip the job."""
+        text = message.text or ""
+        if "Unable to download" in text or "Expired" in text or "Failed" in text or "Sorry" in text:
+            reply_to_id = message.reply_to_message.id if message.reply_to_message else None
+            job = pending_jobs.pop(reply_to_id, None) if reply_to_id else None
+            if not job and pending_jobs:
+                oldest_id = min(pending_jobs.keys())
+                job = pending_jobs.pop(oldest_id, None)
+            if job:
+                job.catbox_video_url = "SKIP"
+                log.warning(f"TeraBox failed for: {job.terabox_url} — skipping job")
+
     @userbot.on_message(
         filters.user(TERABOX_DOWNLOADER_BOT)
         & (filters.video | filters.document)
     )
     async def terabox_reply_received(client: Client, message: Message):
+        # Get the message id this is a reply to
         reply_to_id = (
             message.reply_to_message.id
             if message.reply_to_message
@@ -235,6 +269,7 @@ def attach_reply_monitor(userbot: Client):
         if reply_to_id and reply_to_id in pending_jobs:
             job = pending_jobs[reply_to_id]
         elif pending_jobs:
+            # Fallback: if no reply_to (some bots don't reply), take oldest
             oldest_id = min(pending_jobs.keys())
             job = pending_jobs[oldest_id]
             log.warning("No reply_to match, using oldest pending job as fallback.")
@@ -245,6 +280,7 @@ def attach_reply_monitor(userbot: Client):
 
         log.info(f"Matched video to job: {job.terabox_url}")
 
+        # Download video and upload to Catbox
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp_path = tmp.name
 
@@ -262,7 +298,7 @@ def attach_reply_monitor(userbot: Client):
             async with aiohttp.ClientSession() as sess:
                 job.catbox_video_url = await upload_to_catbox(sess, video_bytes, video_filename)
 
-            log.info(f"Catbox: {job.catbox_video_url}")
+            log.info(f"Video uploaded: {job.catbox_video_url}")
 
         except Exception as e:
             log.exception(f"Video upload failed: {e}")
@@ -270,7 +306,7 @@ def attach_reply_monitor(userbot: Client):
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-# ─── Bot: handlers ────────────────────────────────────────────────────────────
+# ─── Bot: forward handler ─────────────────────────────────────────────────────
 def make_bot(userbot: Client) -> Client:
     bot = Client("terabot_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -281,12 +317,14 @@ def make_bot(userbot: Client) -> Client:
     )
     async def handle_forward(client: Client, message: Message):
         text = message.caption or message.text or ""
+
         urls = TERABOX_RE.findall(text)
         if not urls:
             await message.reply("⚠️ Koi TeraBox link nahi mila.")
             return
         terabox_url = urls[0]
 
+        # Extract image
         image_bytes    = None
         image_filename = "thumbnail.jpg"
 
@@ -298,7 +336,8 @@ def make_bot(userbot: Client) -> Client:
                 image_bytes = await f.read()
             Path(tmp_path).unlink(missing_ok=True)
 
-        elif (message.document and message.document.mime_type
+        elif (message.document
+              and message.document.mime_type
               and message.document.mime_type.startswith("image/")):
             ext = (message.document.file_name or "img.jpg").rsplit(".", 1)[-1]
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
@@ -343,9 +382,16 @@ def make_bot(userbot: Client) -> Client:
     @bot.on_message(filters.private & filters.user(OWNER_ID) & filters.command("start"))
     async def start_cmd(client: Client, message: Message):
         await message.reply(
-            "👋 **PagalBhabhi Bot**\n\n"
-            "Post bhejo (image + TeraBox link caption mein)\n\n"
-            "/status — queue dekho\n"
+            "👋 **TeraBox → Catbox Bot**\n\n"
+            "Forward karo post jisme:\n"
+            "• 🖼 Image ho\n"
+            "• 🔗 TeraBox link ho (caption mein)\n\n"
+            "Bot karega:\n"
+            "1. Image → Catbox\n"
+            "2. Video download → Catbox\n"
+            "3. Firebase mein post save\n"
+            "4. Dono links + Premium/Free buttons DM\n\n"
+            "/status — queue & posts dekho\n"
             "/premium POST_ID — premium karo\n"
             "/free POST_ID — free karo"
         )
@@ -378,17 +424,19 @@ def make_bot(userbot: Client) -> Client:
 
     @bot.on_callback_query()
     async def callback_handler(client: Client, query):
-        if query.from_user.id != OWNER_ID: return
+        if query.from_user.id != OWNER_ID:
+            return
         data = query.data
-        if ":" not in data: return
+        if ":" not in data:
+            return
         action, pid = data.split(":", 1)
         try:
+            from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
             if action == "premium":
                 firebase_set_premium(pid, True)
                 num = firebase_get_post_num(pid)
                 await query.answer(f"👑 Post #{num} premium!")
                 new_text = query.message.text.replace("👑 Status: 🆓 Free", "👑 Status: 👑 Premium")
-                from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 await query.message.edit_text(new_text, reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Premium", callback_data="noop"),
                     InlineKeyboardButton("🆓 Free Karo", callback_data=f"free:{pid}"),
@@ -398,7 +446,6 @@ def make_bot(userbot: Client) -> Client:
                 num = firebase_get_post_num(pid)
                 await query.answer(f"🆓 Post #{num} free!")
                 new_text = query.message.text.replace("👑 Status: 👑 Premium", "👑 Status: 🆓 Free")
-                from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 await query.message.edit_text(new_text, reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("👑 Premium Karo", callback_data=f"premium:{pid}"),
                     InlineKeyboardButton("✅ Free", callback_data="noop"),
@@ -419,7 +466,7 @@ def make_userbot() -> Client:
         session_string=USER_SESSION,
     )
 
-# ─── Health Check ─────────────────────────────────────────────────────────────
+# ─── Health Check Server (Render Web Service ke liye) ────────────────────────
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -431,7 +478,7 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info(f"✅ Health server on port {PORT}")
+    log.info(f"✅ Health server running on port {PORT}")
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 async def main():
@@ -445,6 +492,7 @@ async def main():
 
     asyncio.create_task(queue_worker(bot, userbot))
     await start_health_server()
+
     await idle()
 
     await bot.stop()
