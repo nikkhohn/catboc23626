@@ -88,12 +88,11 @@ async def upload_to_pixeldrain(session: aiohttp.ClientSession, data: bytes, file
     form = aiohttp.FormData()
     form.add_field("file", data, filename=filename, content_type="application/octet-stream")
 
-    async with session.put(
-        f"https://pixeldrain.com/api/file/{filename}",
+    async with session.post(
+        "https://pixeldrain.com/api/file",
         data=form,
         timeout=aiohttp.ClientTimeout(total=300),
     ) as resp:
-        resp.raise_for_status()
         result = await resp.json()
         if "id" not in result:
             raise ValueError(f"Pixeldrain unexpected response: {result}")
