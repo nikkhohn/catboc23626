@@ -36,9 +36,6 @@ OWNER_ID           = int(os.environ["OWNER_ID"])
 
 TERABOX_DOWNLOADER_BOT = "@TeraBoxDownloader_TgBot"
 CATBOX_USERHASH      = os.environ.get("CATBOX_USERHASH", "")
-PIXELDRAIN_API_KEY   = os.environ.get("PIXELDRAIN_API_KEY", "")
-STREAMTAPE_LOGIN     = os.environ.get("STREAMTAPE_LOGIN", "")
-STREAMTAPE_API_KEY   = os.environ.get("STREAMTAPE_API_KEY", "")
 FIREBASE_URL         = os.environ.get("FIREBASE_URL", "")
 FIREBASE_CRED_JSON   = os.environ.get("FIREBASE_CRED_JSON", "")
 FIREBASE_CRED_PATH   = os.environ.get("FIREBASE_CRED_PATH", "serviceAccountKey.json")
@@ -108,8 +105,6 @@ class Job:
     image_filename:      str = "thumbnail.jpg"
     catbox_image_url:    Optional[str] = None
     catbox_video_url:    Optional[str] = None
-    pixeldrain_video_url: Optional[str] = None
-    streamtape_video_url: Optional[str] = None
     sent_msg_id:         Optional[int] = None
     created_at:          float = field(default_factory=time.time)
 
@@ -134,45 +129,6 @@ async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename
         if not url.startswith("https://"):
             raise ValueError(f"Catbox unexpected response: {url}")
         return url
-
-# ─── Pixeldrain Upload ────────────────────────────────────────────────────────
-async def upload_to_pixeldrain(session: aiohttp.ClientSession, data: bytes, filename: str) -> str:
-    if not PIXELDRAIN_API_KEY:
-        raise ValueError("PIXELDRAIN_API_KEY not set")
-    form = aiohttp.FormData()
-    form.add_field("file", data, filename=filename, content_type="application/octet-stream")
-    headers = {"Authorization": aiohttp.helpers.encode_basic_auth("", PIXELDRAIN_API_KEY)}
-    async with session.post(
-        "https://pixeldrain.com/api/file",
-        data=form,
-        headers=headers,
-        timeout=aiohttp.ClientTimeout(total=300),
-    ) as resp:
-        result = await resp.json()
-        if "id" not in result:
-            raise ValueError(f"Pixeldrain unexpected response: {result}")
-        return f"https://pixeldrain.com/api/file/{result['id']}"
-
-# ─── Streamtape Upload ────────────────────────────────────────────────────────
-async def upload_to_streamtape(session: aiohttp.ClientSession, data: bytes, filename: str) -> str:
-    if not STREAMTAPE_LOGIN or not STREAMTAPE_API_KEY:
-        raise ValueError("STREAMTAPE_LOGIN or STREAMTAPE_API_KEY not set")
-    async with session.get(
-        "https://api.streamtape.com/file/ul",
-        params={"login": STREAMTAPE_LOGIN, "key": STREAMTAPE_API_KEY},
-        timeout=aiohttp.ClientTimeout(total=30),
-    ) as resp:
-        result = await resp.json()
-        if result.get("status") != 200:
-            raise ValueError(f"Streamtape get upload URL failed: {result}")
-        upload_url = result["result"]["url"]
-    form = aiohttp.FormData()
-    form.add_field("file", data, filename=filename, content_type="application/octet-stream")
-    async with session.post(upload_url, data=form, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-        result = await resp.json()
-        if result.get("status") != 200:
-            raise ValueError(f"Streamtape upload failed: {result}")
-        return f"https://streamtape.com/v/{result['result']['id']}"
 
 # ─── Queue Worker ─────────────────────────────────────────────────────────────
 async def queue_worker(bot: Client, userbot: Client):
@@ -255,9 +211,7 @@ async def process_job(bot: Client, userbot: Client,
         f"🆔 `{post_id}`\n"
         f"📝 _{caption}_\n\n"
         f"🖼 **Image:** {job.catbox_image_url}\n"
-        f"🎬 **Video (Catbox):** {job.catbox_video_url}\n"
-        f"🎬 **Video (Pixeldrain):** {job.pixeldrain_video_url or 'Upload failed'}\n"
-        f"🎬 **Video (Streamtape):** {job.streamtape_video_url or 'Upload failed'}\n\n"
+        f"🎬 **Video (Catbox):** {job.catbox_video_url}\n\n"
         f"👑 Status: 🆓 Free",
         reply_markup=keyboard
     )
@@ -306,17 +260,9 @@ def attach_reply_monitor(userbot: Client):
                 video_filename = message.document.file_name
 
             async with aiohttp.ClientSession() as sess:
-                catbox_task     = upload_to_catbox(sess, video_bytes, video_filename)
-                pixeldrain_task = upload_to_pixeldrain(sess, video_bytes, video_filename)
-                streamtape_task = upload_to_streamtape(sess, video_bytes, video_filename)
-                results = await asyncio.gather(catbox_task, pixeldrain_task, streamtape_task, return_exceptions=True)
+                job.catbox_video_url = await upload_to_catbox(sess, video_bytes, video_filename)
 
-            catbox_result, pd_result, st_result = results
-            job.catbox_video_url     = str(catbox_result) if not isinstance(catbox_result, Exception) else f"ERROR: {catbox_result}"
-            job.pixeldrain_video_url = str(pd_result) if not isinstance(pd_result, Exception) else None
-            job.streamtape_video_url = str(st_result) if not isinstance(st_result, Exception) else None
-
-            log.info(f"Catbox: {job.catbox_video_url} | Pixeldrain: {job.pixeldrain_video_url}")
+            log.info(f"Catbox: {job.catbox_video_url}")
 
         except Exception as e:
             log.exception(f"Video upload failed: {e}")
