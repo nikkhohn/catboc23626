@@ -2,6 +2,8 @@ import asyncio
 import os
 import re
 import time
+import json
+import random
 import logging
 import aiohttp
 import aiofiles
@@ -14,6 +16,9 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 from aiohttp import web
+
+import firebase_admin
+from firebase_admin import credentials, db
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -30,11 +35,15 @@ USER_SESSION       = os.environ["USER_SESSION"]
 OWNER_ID           = int(os.environ["OWNER_ID"])
 
 TERABOX_DOWNLOADER_BOT = "@TeraBoxDownloader_TgBot"
-CATBOX_USERHASH    = os.environ.get("CATBOX_USERHASH", "")       # optional, empty = anonymous (72hr)
-PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")    # required for pixeldrain
+CATBOX_USERHASH      = os.environ.get("CATBOX_USERHASH", "")
+PIXELDRAIN_API_KEY   = os.environ.get("PIXELDRAIN_API_KEY", "")
+STREAMTAPE_LOGIN     = os.environ.get("STREAMTAPE_LOGIN", "")
+STREAMTAPE_API_KEY   = os.environ.get("STREAMTAPE_API_KEY", "")
+FIREBASE_URL         = os.environ.get("FIREBASE_URL", "")
+FIREBASE_CRED_JSON   = os.environ.get("FIREBASE_CRED_JSON", "")
+FIREBASE_CRED_PATH   = os.environ.get("FIREBASE_CRED_PATH", "serviceAccountKey.json")
 PORT = int(os.environ.get("PORT", 8080))
 
-# TeraBox domains regex
 TERABOX_RE = re.compile(
     r"https?://(?:www\.)?"
     r"(?:terabox\.com|teraboxapp\.com|teraboxlink\.com|freeterabox\.com|"
@@ -44,6 +53,51 @@ TERABOX_RE = re.compile(
     r"/[^\s]+",
     re.IGNORECASE,
 )
+
+CAPTIONS = [
+    "Ekdum Mast Content! Dekhte raho...",
+    "Aaj ka sabse hot upload!",
+    "Itna spicy content pehle kabhi nahi dekha!",
+    "Dhamaka content! Miss mat karna...",
+    "Premium quality, free mein enjoy karo!",
+    "Ye dekh ke pagal ho jaoge!",
+    "Sirf adults ke liye — 18+ content!",
+    "Aaj raat ke liye perfect entertainment!",
+    "Full masti, full entertainment!",
+    "Popcorn lo aur enjoy karo!",
+    "Bhabhi ka naya jawab nahi!",
+    "Devar bhabhi ka dhamakedar scene!",
+    "Aaj ki raat rangeen hogi!",
+    "Ye video dekhe bina mat sona!",
+    "Seedha dil pe lagega yeh content!",
+]
+
+# ─── Firebase init ────────────────────────────────────────────────────────────
+if FIREBASE_URL:
+    cred = credentials.Certificate(
+        json.loads(FIREBASE_CRED_JSON) if FIREBASE_CRED_JSON else FIREBASE_CRED_PATH
+    )
+    firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_URL})
+    log.info("✅ Firebase connected!")
+
+def firebase_save_post(video_url: str, image_url: str, caption: str) -> str:
+    post = db.reference("posts").push({
+        "name": caption, "caption": caption,
+        "image": image_url, "redirect": video_url,
+        "premium": False, "isNew": True,
+        "order": int(time.time() * 1000)
+    })
+    return post.key
+
+def firebase_get_post_num(post_id: str) -> int:
+    try:
+        posts = db.reference("posts").get() or {}
+        ids = sorted(posts, key=lambda k: posts[k].get("order", 0), reverse=True)
+        return ids.index(post_id) + 1 if post_id in ids else 0
+    except: return 0
+
+def firebase_set_premium(post_id: str, val: bool):
+    db.reference(f"posts/{post_id}").update({"premium": val})
 
 # ─── Shared State ────────────────────────────────────────────────────────────
 @dataclass
@@ -55,14 +109,12 @@ class Job:
     catbox_image_url:    Optional[str] = None
     catbox_video_url:    Optional[str] = None
     pixeldrain_video_url: Optional[str] = None
-    sent_msg_id:         Optional[int] = None   # msg id of link we sent to TeraBox bot
+    streamtape_video_url: Optional[str] = None
+    sent_msg_id:         Optional[int] = None
     created_at:          float = field(default_factory=time.time)
 
 job_queue:    asyncio.Queue  = asyncio.Queue()
-
-# sent_msg_id → Job  (for exact reply matching)
 pending_jobs: dict[int, Job] = {}
-
 processing_lock = asyncio.Lock()
 
 # ─── Catbox Upload ────────────────────────────────────────────────────────────
@@ -72,7 +124,6 @@ async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename
     form.add_field("userhash",     CATBOX_USERHASH)
     form.add_field("fileToUpload", data, filename=filename,
                    content_type="application/octet-stream")
-
     async with session.post(
         "https://catbox.moe/user/api.php",
         data=form,
@@ -84,25 +135,44 @@ async def upload_to_catbox(session: aiohttp.ClientSession, data: bytes, filename
             raise ValueError(f"Catbox unexpected response: {url}")
         return url
 
-
 # ─── Pixeldrain Upload ────────────────────────────────────────────────────────
 async def upload_to_pixeldrain(session: aiohttp.ClientSession, data: bytes, filename: str) -> str:
     if not PIXELDRAIN_API_KEY:
         raise ValueError("PIXELDRAIN_API_KEY not set")
     form = aiohttp.FormData()
     form.add_field("file", data, filename=filename, content_type="application/octet-stream")
-    auth = aiohttp.BasicAuth(login="", password=PIXELDRAIN_API_KEY)
-
+    headers = {"Authorization": aiohttp.helpers.encode_basic_auth("", PIXELDRAIN_API_KEY)}
     async with session.post(
         "https://pixeldrain.com/api/file",
         data=form,
-        auth=auth,
+        headers=headers,
         timeout=aiohttp.ClientTimeout(total=300),
     ) as resp:
         result = await resp.json()
         if "id" not in result:
             raise ValueError(f"Pixeldrain unexpected response: {result}")
-        return f"https://pixeldrain.com/u/{result['id']}"
+        return f"https://pixeldrain.com/api/file/{result['id']}"
+
+# ─── Streamtape Upload ────────────────────────────────────────────────────────
+async def upload_to_streamtape(session: aiohttp.ClientSession, data: bytes, filename: str) -> str:
+    if not STREAMTAPE_LOGIN or not STREAMTAPE_API_KEY:
+        raise ValueError("STREAMTAPE_LOGIN or STREAMTAPE_API_KEY not set")
+    async with session.get(
+        "https://api.streamtape.com/file/ul",
+        params={"login": STREAMTAPE_LOGIN, "key": STREAMTAPE_API_KEY},
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
+        result = await resp.json()
+        if result.get("status") != 200:
+            raise ValueError(f"Streamtape get upload URL failed: {result}")
+        upload_url = result["result"]["url"]
+    form = aiohttp.FormData()
+    form.add_field("file", data, filename=filename, content_type="application/octet-stream")
+    async with session.post(upload_url, data=form, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+        result = await resp.json()
+        if result.get("status") != 200:
+            raise ValueError(f"Streamtape upload failed: {result}")
+        return f"https://streamtape.com/v/{result['result']['id']}"
 
 # ─── Queue Worker ─────────────────────────────────────────────────────────────
 async def queue_worker(bot: Client, userbot: Client):
@@ -132,7 +202,7 @@ async def process_job(bot: Client, userbot: Client,
     )
     log.info(f"Image uploaded: {job.catbox_image_url}")
 
-    # Step 2: Send TeraBox link via userbot (FloodWait handled)
+    # Step 2: Send TeraBox link via userbot
     await bot.send_message(job.chat_id, "📤 TeraBox bot ko link bhej raha hun...")
     while True:
         try:
@@ -157,35 +227,49 @@ async def process_job(bot: Client, userbot: Client,
 
     if job.catbox_video_url is None:
         raise TimeoutError("TeraBox bot ne 8 minute mein video nahi diya.")
-
     if job.catbox_video_url.startswith("ERROR:"):
         raise RuntimeError(job.catbox_video_url)
 
     log.info(f"Catbox video done: {job.catbox_video_url}")
 
-    # Step 4: Done — DM owner
+    # ── Firebase mein save karo ───────────────────────────────────────────────
+    video_url = job.catbox_video_url  # Catbox video URL website pe use hoga
+    image_url = job.catbox_image_url or ""
+    caption   = random.choice(CAPTIONS)
+
+    loop = asyncio.get_event_loop()
+    post_id  = await loop.run_in_executor(None, firebase_save_post, video_url, image_url, caption)
+    post_num = await loop.run_in_executor(None, firebase_get_post_num, post_id)
+    log.info(f"✅ Post #{post_num} saved: {post_id}")
+
+    # Step 4: Done — DM owner with preview + Premium/Free buttons
+    from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("👑 Premium Karo", callback_data=f"premium:{post_id}"),
+        InlineKeyboardButton("🆓 Free Rakho",   callback_data=f"free:{post_id}"),
+    ]])
+
     await bot.send_message(
         job.chat_id,
-        f"✅ **Done!**\n\n"
-        f"🖼 **Image (Catbox):**\n{job.catbox_image_url}\n\n"
-        f"🎬 **Video (Catbox):**\n{job.catbox_video_url}\n\n"
-        f"🎬 **Video (Pixeldrain):**\n{job.pixeldrain_video_url or 'Upload failed'}",
+        f"✅ **Post #{post_num} Complete!**\n\n"
+        f"🆔 `{post_id}`\n"
+        f"📝 _{caption}_\n\n"
+        f"🖼 **Image:** {job.catbox_image_url}\n"
+        f"🎬 **Video (Catbox):** {job.catbox_video_url}\n"
+        f"🎬 **Video (Pixeldrain):** {job.pixeldrain_video_url or 'Upload failed'}\n"
+        f"🎬 **Video (Streamtape):** {job.streamtape_video_url or 'Upload failed'}\n\n"
+        f"👑 Status: 🆓 Free",
+        reply_markup=keyboard
     )
     log.info(f"Job complete: {job.terabox_url}")
 
 # ─── Userbot: TeraBox bot reply monitor ──────────────────────────────────────
 def attach_reply_monitor(userbot: Client):
-    """
-    TeraBox bot replies to our sent message with the video.
-    We match via reply_to_message.id == job.sent_msg_id — 100% accurate.
-    """
-
     @userbot.on_message(
         filters.user(TERABOX_DOWNLOADER_BOT)
         & (filters.video | filters.document)
     )
     async def terabox_reply_received(client: Client, message: Message):
-        # Get the message id this is a reply to
         reply_to_id = (
             message.reply_to_message.id
             if message.reply_to_message
@@ -197,7 +281,6 @@ def attach_reply_monitor(userbot: Client):
         if reply_to_id and reply_to_id in pending_jobs:
             job = pending_jobs[reply_to_id]
         elif pending_jobs:
-            # Fallback: if no reply_to (some bots don't reply), take oldest
             oldest_id = min(pending_jobs.keys())
             job = pending_jobs[oldest_id]
             log.warning("No reply_to match, using oldest pending job as fallback.")
@@ -208,7 +291,6 @@ def attach_reply_monitor(userbot: Client):
 
         log.info(f"Matched video to job: {job.terabox_url}")
 
-        # Download video and upload to Catbox
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
             tmp_path = tmp.name
 
@@ -224,25 +306,25 @@ def attach_reply_monitor(userbot: Client):
                 video_filename = message.document.file_name
 
             async with aiohttp.ClientSession() as sess:
-                # Upload to Catbox and Pixeldrain simultaneously
-                catbox_task = upload_to_catbox(sess, video_bytes, video_filename)
+                catbox_task     = upload_to_catbox(sess, video_bytes, video_filename)
                 pixeldrain_task = upload_to_pixeldrain(sess, video_bytes, video_filename)
-                results = await asyncio.gather(catbox_task, pixeldrain_task, return_exceptions=True)
+                streamtape_task = upload_to_streamtape(sess, video_bytes, video_filename)
+                results = await asyncio.gather(catbox_task, pixeldrain_task, streamtape_task, return_exceptions=True)
 
-            catbox_result, pd_result = results
-            job.catbox_video_url = str(catbox_result) if not isinstance(catbox_result, Exception) else f"ERROR: {catbox_result}"
-            job.pixeldrain_video_url = str(pd_result) if not isinstance(pd_result, Exception) else f"Upload failed: {pd_result}"
+            catbox_result, pd_result, st_result = results
+            job.catbox_video_url     = str(catbox_result) if not isinstance(catbox_result, Exception) else f"ERROR: {catbox_result}"
+            job.pixeldrain_video_url = str(pd_result) if not isinstance(pd_result, Exception) else None
+            job.streamtape_video_url = str(st_result) if not isinstance(st_result, Exception) else None
 
             log.info(f"Catbox: {job.catbox_video_url} | Pixeldrain: {job.pixeldrain_video_url}")
 
         except Exception as e:
             log.exception(f"Video upload failed: {e}")
             job.catbox_video_url = f"ERROR: {e}"
-            job.pixeldrain_video_url = "Upload failed"
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-# ─── Bot: forward handler ─────────────────────────────────────────────────────
+# ─── Bot: handlers ────────────────────────────────────────────────────────────
 def make_bot(userbot: Client) -> Client:
     bot = Client("terabot_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -253,14 +335,12 @@ def make_bot(userbot: Client) -> Client:
     )
     async def handle_forward(client: Client, message: Message):
         text = message.caption or message.text or ""
-
         urls = TERABOX_RE.findall(text)
         if not urls:
             await message.reply("⚠️ Koi TeraBox link nahi mila.")
             return
         terabox_url = urls[0]
 
-        # Extract image
         image_bytes    = None
         image_filename = "thumbnail.jpg"
 
@@ -272,8 +352,7 @@ def make_bot(userbot: Client) -> Client:
                 image_bytes = await f.read()
             Path(tmp_path).unlink(missing_ok=True)
 
-        elif (message.document
-              and message.document.mime_type
+        elif (message.document and message.document.mime_type
               and message.document.mime_type.startswith("image/")):
             ext = (message.document.file_name or "img.jpg").rsplit(".", 1)[-1]
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
@@ -304,25 +383,84 @@ def make_bot(userbot: Client) -> Client:
 
     @bot.on_message(filters.private & filters.user(OWNER_ID) & filters.command("status"))
     async def status_cmd(client: Client, message: Message):
+        posts = db.reference("posts").get() or {} if FIREBASE_URL else {}
+        prem  = sum(1 for p in posts.values() if p.get("premium"))
         await message.reply(
-            f"📊 **Queue Status**\n"
-            f"Waiting: `{job_queue.qsize()}` jobs\n"
-            f"Processing: `{len(pending_jobs)}` jobs"
+            f"📊 **Status**\n\n"
+            f"⏳ Queue: `{job_queue.qsize()}` jobs\n"
+            f"🔄 Processing: `{len(pending_jobs)}` jobs\n"
+            f"📹 Posts: `{len(posts)}`\n"
+            f"👑 Premium: `{prem}`\n"
+            f"🆓 Free: `{len(posts)-prem}`"
         )
 
     @bot.on_message(filters.private & filters.user(OWNER_ID) & filters.command("start"))
     async def start_cmd(client: Client, message: Message):
         await message.reply(
-            "👋 **TeraBox → Catbox Bot**\n\n"
-            "Forward karo post jisme:\n"
-            "• 🖼 Image ho\n"
-            "• 🔗 TeraBox link ho (caption mein)\n\n"
-            "Bot karega:\n"
-            "1. Image → Catbox\n"
-            "2. Video download → Catbox\n"
-            "3. Dono links DM\n\n"
-            "/status — queue dekho"
+            "👋 **PagalBhabhi Bot**\n\n"
+            "Post bhejo (image + TeraBox link caption mein)\n\n"
+            "/status — queue dekho\n"
+            "/premium POST_ID — premium karo\n"
+            "/free POST_ID — free karo"
         )
+
+    @bot.on_message(filters.private & filters.user(OWNER_ID) & filters.command("premium"))
+    async def premium_cmd(client: Client, message: Message):
+        args = message.text.split()
+        if len(args) < 2:
+            return await message.reply("Usage: `/premium POST_ID`")
+        pid = args[1]
+        try:
+            firebase_set_premium(pid, True)
+            num = firebase_get_post_num(pid)
+            await message.reply(f"👑 Post #{num} premium ho gaya!")
+        except Exception as e:
+            await message.reply(f"❌ {e}")
+
+    @bot.on_message(filters.private & filters.user(OWNER_ID) & filters.command("free"))
+    async def free_cmd(client: Client, message: Message):
+        args = message.text.split()
+        if len(args) < 2:
+            return await message.reply("Usage: `/free POST_ID`")
+        pid = args[1]
+        try:
+            firebase_set_premium(pid, False)
+            num = firebase_get_post_num(pid)
+            await message.reply(f"🆓 Post #{num} free ho gaya!")
+        except Exception as e:
+            await message.reply(f"❌ {e}")
+
+    @bot.on_callback_query()
+    async def callback_handler(client: Client, query):
+        if query.from_user.id != OWNER_ID: return
+        data = query.data
+        if ":" not in data: return
+        action, pid = data.split(":", 1)
+        try:
+            if action == "premium":
+                firebase_set_premium(pid, True)
+                num = firebase_get_post_num(pid)
+                await query.answer(f"👑 Post #{num} premium!")
+                new_text = query.message.text.replace("👑 Status: 🆓 Free", "👑 Status: 👑 Premium")
+                from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                await query.message.edit_text(new_text, reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Premium", callback_data="noop"),
+                    InlineKeyboardButton("🆓 Free Karo", callback_data=f"free:{pid}"),
+                ]]))
+            elif action == "free":
+                firebase_set_premium(pid, False)
+                num = firebase_get_post_num(pid)
+                await query.answer(f"🆓 Post #{num} free!")
+                new_text = query.message.text.replace("👑 Status: 👑 Premium", "👑 Status: 🆓 Free")
+                from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                await query.message.edit_text(new_text, reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("👑 Premium Karo", callback_data=f"premium:{pid}"),
+                    InlineKeyboardButton("✅ Free", callback_data="noop"),
+                ]]))
+            elif action == "noop":
+                await query.answer("Already set hai!", show_alert=True)
+        except Exception as e:
+            await query.answer(f"❌ {e}", show_alert=True)
 
     return bot
 
@@ -335,7 +473,7 @@ def make_userbot() -> Client:
         session_string=USER_SESSION,
     )
 
-# ─── Health Check Server (Render Web Service ke liye) ────────────────────────
+# ─── Health Check ─────────────────────────────────────────────────────────────
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -347,7 +485,7 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info(f"✅ Health server running on port {PORT}")
+    log.info(f"✅ Health server on port {PORT}")
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 async def main():
@@ -361,7 +499,6 @@ async def main():
 
     asyncio.create_task(queue_worker(bot, userbot))
     await start_health_server()
-
     await idle()
 
     await bot.stop()
